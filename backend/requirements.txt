@@ -1,0 +1,24 @@
+# FastAPI
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# Streamlit
+streamlit==1.39.0
+
+# RAG
+torch>=2.1.0  # 先装: pip install torch --index-url https://download.pytorch.org/whl/cpu
+langchain-chroma==0.1.4
+langchain-huggingface==0.1.2
+langchain-core==0.3.15
+langchain-community==0.3.1
+sentence-transformers==3.1.1
+pymupdf==1.24.12
+
+# LLM
+openai==1.51.0
+
+# Utils
+python-dotenv==1.0.1
+PyYAML==6.0.2
+requests>=2.31.0
