@@ -54,6 +54,19 @@ def _handle_query(req: QueryRequest) -> ReportResponse:
     intent = parse_query(req.text)
     parsed = QueryIntent(**intent)
 
+    # Debug info collector
+    debug = {"steps": []}
+    parsed_data = {"原始查询": req.text, "intent": intent.get("intent", "")}
+    if intent.get("genes"):
+        parsed_data["基因"] = intent["genes"]
+    if intent.get("genotypes"):
+        parsed_data["基因型"] = intent["genotypes"]
+    if intent.get("drug"):
+        parsed_data["药物"] = intent["drug"]
+    if intent.get("symptom"):
+        parsed_data["症状"] = intent["symptom"]
+    debug["steps"].append({"name": "查询解析", "data": parsed_data})
+
     # Step 2: Determine routes
     has_exact_genotype = bool(parsed.genotypes and parsed.drug)
 
@@ -69,16 +82,16 @@ def _handle_query(req: QueryRequest) -> ReportResponse:
         except Exception as e:
             print(f"[WARN] CPIC query failed: {e}")
 
-    # RAG retrieval (for all inputs)
+    # RAG retrieval (only if no structured results — avoid noise)
     rag_response = {"results": [], "confidence": "low", "top_score": 0.0}
-    if retriever.store.available:
+    if not structured_results and retriever.store.available:
         rag_response = retriever.search_by_intent(
             query=req.text,
             gene=parsed.genes[0] if parsed.genes else None,
             drug=parsed.drug,
             top_k=req.top_k or 5,
         )
-    else:
+    elif not retriever.store.available:
         print("[WARN] Vector store unavailable, skipping RAG retrieval")
 
     # Rule engine (registered engines matching input genotypes)
@@ -95,9 +108,10 @@ def _handle_query(req: QueryRequest) -> ReportResponse:
                 parsed_intent=parsed,
                 rule_engine_result=None,
                 report_text=(
-                    "## 无法评估\n\n"
-                    "当前知识库中没有与您描述相关的药物基因组学信息。\n\n"
-                    "请提供更具体的药物、基因或基因型信息以便进一步查询。"
+                    "## 无充分证据\n\n"
+                    "当前 CPIC 指南中没有与您描述相关的药物基因组学证据。\n\n"
+                    "请提供更具体的药物、基因或基因型信息以便进一步查询。\n\n"
+                    "> ⚠️ **本结论仅基于 CPIC 指南数据，不排除其他临床证据来源。**"
                 ),
                 sources=[],
             )
@@ -114,12 +128,72 @@ def _handle_query(req: QueryRequest) -> ReportResponse:
     # Step 4: Build source references
     sources = _build_sources(rag_response.get("results", []), structured_results)
 
+    # Build debug info
+    # -- routing decision: show only the PRIMARY route
+    routes = []
+    if rule_result:
+        routes.append(f"✅ 规则引擎（{', '.join(rule_results.keys())}）")
+    elif structured_results:
+        routes.append(f"✅ CPIC 结构化查询（精确基因型匹配）")
+    elif rag_response.get("results"):
+        routes.append(f"✅ RAG 语义检索（top_score={rag_response.get('top_score', 0):.2f}）")
+    else:
+        routes.append("❌ 知识库无匹配 → 返回无充分证据")
+    debug["steps"].append({"name": "路由决策", "data": {"路由": routes}})
+
+    # -- RAG details (only when RAG was the PRIMARY source of answer)
+    if rag_response.get("results") and not rule_result:
+        import hashlib
+        seen_content = set()
+        rerank_scores = []
+        dup_count = 0
+        for r in rag_response.get("results", []):
+            content_key = hashlib.md5(r.get("content", "")[:80].encode()).hexdigest()
+            score = r.get("rerank_score") or (1.0 - (r.get("distance") or 0))
+            meta = r.get("metadata", {})
+            entry = {
+                "score": round(float(score), 3),
+                "source": meta.get("source", ""),
+                "drug": meta.get("drug", ""),
+                "gene": meta.get("gene", ""),
+            }
+            if content_key in seen_content:
+                dup_count += 1
+                continue
+            seen_content.add(content_key)
+            rerank_scores.append(entry)
+        dedup_note = ""
+        if dup_count > 0:
+            dedup_note = f"（原始 {len(rerank_scores) + dup_count} 条，去重合并 {dup_count} 条相似内容）"
+        rag_detail = {
+            "策略": "语义向量搜索（ChromaDB + bge-base-en-v1.5）",
+            "查询改写": rag_response.get("expanded_queries", [req.text]),
+            "总检索数": rag_response.get("total_retrieved", 0),
+            "rerank 后取 top": len(rerank_scores),
+            "证据校验删除": rag_response.get("irrelevant_removed", 0),
+            "rerank 得分": rerank_scores,
+            "去重说明": dedup_note,
+        }
+        if rag_response.get("hyde_used"):
+            rag_detail["HyDE"] = "已启用"
+        debug["steps"].append({"name": "RAG 检索", "data": rag_detail})
+
+    # -- report quality
+    debug["steps"].append({
+        "name": "报告质量", "data": {
+            "置信度": report.get("confidence", "low"),
+            "章节数": len(report.get("sections", [])),
+            "证据校验": "通过" if not report.get("evidence_warning") else report.get("evidence_warning"),
+        }
+    })
+
     return ReportResponse(
         query=req.text,
         parsed_intent=parsed,
         rule_engine_result=rule_result,
         report_text=_format_report(report),
         sources=sources,
+        debug_info=debug,
     )
 
 
@@ -181,9 +255,9 @@ def _format_report(report: dict) -> str:
 
     lines = []
 
-    # Self-RAG warning (if any)
-    if report.get("self_rag_warning"):
-        lines.append(f"> ⚠️ **自查警告**: {report['self_rag_warning']}\n")
+    # Evidence check warning (if any)
+    if report.get("evidence_warning"):
+        lines.append(f"> ⚠️ **证据校验警告**: {report['evidence_warning']}\n")
 
     for sec in report["sections"]:
         lines.append(f"## {sec['title']}")

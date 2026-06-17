@@ -28,7 +28,10 @@ class VectorStore:
         try:
             self.embeddings = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL,
-                model_kwargs={"device": EMBEDDING_DEVICE},
+                model_kwargs={
+                    "device": EMBEDDING_DEVICE,
+                    "local_files_only": True,
+                },
                 encode_kwargs={"normalize_embeddings": True},
             )
         except Exception as e:

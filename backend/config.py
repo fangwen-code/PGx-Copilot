@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# HuggingFace mirror (for users in China where huggingface.co is blocked)
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 # Project paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
@@ -43,8 +46,8 @@ HYDE_ENABLED = os.getenv("HYDE_ENABLED", "false").lower() == "true"
 QUERY_EXPANSION_ENABLED = os.getenv("QUERY_EXPANSION_ENABLED", "true").lower() == "true"
 QUERY_EXPANSION_NUM = 3
 
-# Self-RAG
-SELF_RAG_ENABLED = os.getenv("SELF_RAG_ENABLED", "true").lower() == "true"
+# Evidence verification
+EVIDENCE_CHECK_ENABLED = os.getenv("EVIDENCE_CHECK_ENABLED", "true").lower() == "true"
 
 # Server
 HOST = os.getenv("HOST", "127.0.0.1")

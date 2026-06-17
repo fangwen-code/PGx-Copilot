@@ -62,7 +62,7 @@ def evaluate(strategy: str = "default", top_k: int = 5):
                 q["input"], top_k=top_k,
                 use_hyde=(strategy in ("hyde", "all", "default")),
                 use_expansion=(strategy in ("expansion", "all", "default")),
-                use_self_rag=False,
+                use_evidence_check=False,
             )
 
         elapsed = time.time() - t0

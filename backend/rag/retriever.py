@@ -6,28 +6,31 @@ Orchestrates:
   2. HyDE (hypothetical document embedding)
   3. Dense retrieval (ChromaDB)
   4. Cross-encoder rerank
-  5. Self-RAG relevance filter
+  5. Evidence-based relevance filter
   6. Confidence scoring
 """
 
+import json
+from pathlib import Path
+
 from config import (
     CONFIDENCE_HIGH_THRESHOLD, CONFIDENCE_MEDIUM_THRESHOLD,
-    HYDE_ENABLED, QUERY_EXPANSION_ENABLED,
+    HYDE_ENABLED, QUERY_EXPANSION_ENABLED, DATA_DIR,
 )
 from rag.vector_store import VectorStore
 from rag.reranker import Reranker
 from rag.query_expansion import expand_query
 from rag.hyde import generate_hypothetical_document
-from rag.self_rag import SelfRAG
+from rag.evidence_verifier import EvidenceVerifier
 
 
 class Retriever:
-    """Full retrieval pipeline with expansion, HyDE, rerank, and self-check."""
+    """Full retrieval pipeline with expansion, HyDE, rerank, and evidence check."""
 
     def __init__(self):
         self.store = VectorStore()
         self.reranker = Reranker()
-        self.self_rag = SelfRAG()
+        self.evidence_checker = EvidenceVerifier()
 
     def search(
         self,
@@ -38,7 +41,7 @@ class Retriever:
         use_hyde: bool = HYDE_ENABLED,
         use_expansion: bool = QUERY_EXPANSION_ENABLED,
         use_rerank: bool = True,
-        use_self_rag: bool = True,
+        use_evidence_check: bool = True,
     ) -> dict:
         """
         Full retrieval pipeline.
@@ -87,16 +90,17 @@ class Retriever:
         if not candidates:
             return {"results": [], "confidence": "low", "top_score": 0.0,
                     "total_retrieved": 0, "expansions_used": len(queries) - 1,
-                    "hyde_used": hyde_doc is not None, "irrelevant_removed": 0}
+                    "expanded_queries": queries, "hyde_used": hyde_doc is not None,
+                    "irrelevant_removed": 0}
 
         # Step 4: Cross-encoder rerank
         if use_rerank:
             candidates = self.reranker.rerank(query, candidates, top_k=top_k)
 
-        # Step 5: Self-RAG relevance filter
+        # Step 5: Evidence-based relevance filter
         irrelevant_removed = 0
-        if use_self_rag and self.self_rag._llm_available:
-            candidates, irrelevant_removed = self.self_rag.filter_by_relevance(query, candidates)
+        if use_evidence_check and self.evidence_checker._llm_available:
+            candidates, irrelevant_removed = self.evidence_checker.filter_by_relevance(query, candidates)
 
         # Step 6: Confidence scoring (based on rerank score or distance)
         if candidates:
@@ -121,6 +125,7 @@ class Retriever:
             "top_score": top_score,
             "total_retrieved": len(candidates),
             "expansions_used": len(queries) - 1,
+            "expanded_queries": queries,
             "hyde_used": hyde_doc is not None,
             "irrelevant_removed": irrelevant_removed,
         }
@@ -158,7 +163,22 @@ class Retriever:
             result = self.search(targeted, top_k=top_k, metadata_filter=metadata_filter)
             if result.get("results"):
                 return result
-            # Fall back to unfiltered search
-            print(f"[Retriever] Filtered search returned 0 results for {metadata_filter}, falling back to semantic search")
+            # Fall back to unfiltered search — and log the coverage gap
+            _log_coverage_gap(query, metadata_filter)
 
         return self.search(targeted, top_k=top_k)
+
+
+_COVERAGE_LOG = DATA_DIR / "coverage_gaps.jsonl"
+
+
+def _log_coverage_gap(query: str, metadata_filter: dict):
+    """Log unmatched metadata filters to a JSONL file for coverage analysis."""
+    try:
+        _COVERAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"query": query, "filter": metadata_filter}
+        with open(str(_COVERAGE_LOG), "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        print(f"[Coverage] Logged gap: {metadata_filter}")
+    except Exception as e:
+        pass  # best-effort logging

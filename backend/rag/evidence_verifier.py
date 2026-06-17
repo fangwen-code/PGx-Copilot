@@ -1,5 +1,5 @@
 """
-Self-RAG: self-check and faithfulness validation.
+Evidence Verifier: relevance and faithfulness validation.
 
 1. Relevance check: are retrieved chunks actually relevant to the query?
 2. Faithfulness check: is the generated answer supported by the retrieved chunks?
@@ -36,8 +36,8 @@ Report section:
 """
 
 
-class SelfRAG:
-    """Self-validation layer for RAG quality."""
+class EvidenceVerifier:
+    """Validation layer for RAG quality — relevance filtering + faithfulness check."""
 
     def __init__(self):
         self._llm_available = (
@@ -100,7 +100,6 @@ class SelfRAG:
         """
         filtered = []
         removed = 0
-        # Only run relevance check on top chunks — saves LLM calls
         to_check = results[:max_check]
         rest = results[max_check:]
 
@@ -112,7 +111,6 @@ class SelfRAG:
             else:
                 removed += 1
 
-        # Keep unchecked results but mark them as unverified
         for r in rest:
             r["relevance"] = "unverified"
             filtered.append(r)

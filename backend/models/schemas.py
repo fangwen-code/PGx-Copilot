@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any
 
 
 class QueryRequest(BaseModel):
@@ -34,3 +34,4 @@ class ReportResponse(BaseModel):
     rule_engine_result: Optional[str] = None
     report_text: str
     sources: list[SourceRef]
+    debug_info: Optional[dict[str, Any]] = None

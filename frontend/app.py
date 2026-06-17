@@ -20,9 +20,9 @@ with st.sidebar:
     examples = [
         "🧬 CYP2D6 *4/*4 吃美托洛尔",
         "🧬 SLCO1B1 TC APOE E3/E4 他汀安全吗",
+        "🧬 NAT2 肼屈嗪风险",
         "🧬 CYP2C9 *1/*3 氯沙坦",
         "🧬 氯吡格雷 CYP2C19 中间代谢",
-        "🧬 NAT2 肼屈嗪风险",
         "💊 warfarin 剂量",
         "⚠️ 我头晕",
     ]
@@ -143,6 +143,63 @@ if submit or (query_text.strip() and st.session_state.get("auto_submit")):
                                 st.caption(src["content"][:400])
                                 if i < len(data["sources"]):
                                     st.markdown("---")
+
+                # Debug panel (for interview demo)
+                if data.get("debug_info"):
+                    with st.expander("▸ 技术分析过程", expanded=False):
+                        for step in data["debug_info"]["steps"]:
+                            st.markdown(f"**{step['name']}**")
+                            d = step["data"]
+                            if step["name"] == "查询解析":
+                                st.caption(f"原始查询: {d.get('原始查询', '')}")
+                                fields = []
+                                genotype_str = ""
+                                if d.get("intent"):
+                                    fields.append(("Intent", d["intent"]))
+                                if d.get("基因"):
+                                    fields.append(("基因", ", ".join(d["基因"])))
+                                if d.get("基因型"):
+                                    genotype_str = ", ".join(f"{k}={v}" for k, v in d["基因型"].items())
+                                if d.get("药物"):
+                                    fields.append(("药物", d["药物"]))
+                                if d.get("症状"):
+                                    fields.append(("症状", d["症状"]))
+                                if fields:
+                                    cols = st.columns(len(fields))
+                                    for i, (label, val) in enumerate(fields):
+                                        cols[i].metric(label, val)
+                                if genotype_str:
+                                    st.caption(f"🧬 基因型: {genotype_str}")
+                            elif step["name"] == "路由决策":
+                                for r in d.get("路由", []):
+                                    st.write(r)
+                            elif step["name"] == "RAG 检索":
+                                st.write(f"**策略**: {d.get('策略', '')}")
+                                queries = d.get("查询改写", [])
+                                if len(queries) > 1:
+                                    with st.container():
+                                        st.write(f"**Query Expansion** ({len(queries)} 个变体):")
+                                        for q in queries:
+                                            st.code(q, language="text")
+                                hyde = d.get("HyDE")
+                                if hyde:
+                                    st.write(f"**HyDE**: {hyde}")
+                                dedup_note = d.get("去重说明", "")
+                                st.write(f"总检索: {d.get('总检索数', 0)}  |  重排序后取: {d.get('rerank 后取 top', 0)}  |  证据校验删除: {d.get('证据校验删除', 0)}" + dedup_note)
+                                scores = d.get("rerank 得分", [])
+                                if scores:
+                                    st.write("**Cross-encoder 重排序得分:**")
+                                    for i, s in enumerate(scores, 1):
+                                        pct = int(s["score"] * 100)
+                                        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                                        st.markdown(f"`{i}.` {bar} `{s['score']:.2f}`  [{s['source']}] {s.get('drug', '')} {s.get('gene', '')}".strip())
+                            elif step["name"] == "报告质量":
+                                col1, col2, col3 = st.columns(3)
+                                col1.metric("置信度", d.get("置信度", ""))
+                                col2.metric("章节数", d.get("章节数", 0))
+                                evidence = d.get("证据校验", "")
+                                col3.markdown(f"**证据校验**: {'✅ 通过' if evidence == '通过' else '⚠️ ' + evidence}")
+
             else:
                 st.error(f"API 错误: {resp.status_code}")
         except requests.exceptions.ConnectionError:

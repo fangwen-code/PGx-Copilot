@@ -1,10 +1,10 @@
 """
-LLM report generator with Self-RAG faithfulness validation.
+LLM report generator with evidence faithfulness validation.
 
 Pipeline:
   1. Build evidence context from structured + RAG results
   2. Generate clinical report via LLM (constrained to evidence)
-  3. Self-RAG check: verify faithfulness of generated report against evidence
+  3. Evidence check: verify faithfulness of generated report against evidence
   4. If unfaithful claims found, regenerate or flag them
 """
 
@@ -12,7 +12,7 @@ import json
 import hashlib
 from openai import OpenAI
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, SELF_RAG_ENABLED
+from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, EVIDENCE_CHECK_ENABLED
 
 _cache: dict[str, dict] = {}
 
@@ -45,7 +45,7 @@ def generate_report(
     rag_results: list[dict],
     rule_engine_result: str | None = None,
 ) -> dict:
-    """Generate and self-validate a clinical report."""
+    """Generate and validate a clinical report with evidence check."""
     cache_key = hashlib.md5(
         json.dumps({"q": user_query, "r": len(rag_results)}, sort_keys=True).encode()
     ).hexdigest()
@@ -100,15 +100,15 @@ def generate_report(
     # Generate
     report = _call_llm(user_query, parsed_intent, evidence_text, confidence)
 
-    # Self-RAG: faithfulness check
-    if SELF_RAG_ENABLED and report.get("sections"):
-        from rag.self_rag import SelfRAG
-        checker = SelfRAG()
+    # Evidence faithfulness check
+    if EVIDENCE_CHECK_ENABLED and report.get("sections"):
+        from rag.evidence_verifier import EvidenceVerifier
+        checker = EvidenceVerifier()
         check = checker.check_faithfulness(report, evidence_text)
         if not check.get("faithful", True):
             unsupported = check.get("unsupported_claims", [])
-            print(f"[Self-RAG] Found {len(unsupported)} unsupported claim(s): {unsupported[:2]}")
-            report["self_rag_warning"] = (
+            print(f"[EvidenceCheck] Found {len(unsupported)} unsupported claim(s): {unsupported[:2]}")
+            report["evidence_warning"] = (
                 f"The following claims could not be verified against the provided evidence: "
                 f"{'; '.join(unsupported[:3])}"
             )
@@ -153,8 +153,8 @@ def _call_llm(user_query, parsed_intent, evidence_text, confidence) -> dict:
 def _no_evidence_response() -> dict:
     return {
         "sections": [{
-            "title": "无法评估",
-            "content": "当前知识库中没有匹配的临床证据，无法生成报告。",
+            "title": "无充分证据",
+            "content": "当前 CPIC 指南中没有匹配的临床证据，无法生成报告。",
             "citations": [],
         }],
         "confidence": "low",
@@ -182,6 +182,6 @@ def _fallback_report(user_query, struct_results, rag_results, rule_result) -> di
         sections.insert(0, {"title": "他汀类药物评估（规则引擎）",
                            "content": rule_result, "citations": ["CPIC SLCO1B1 + APOE"]})
     if not sections:
-        sections.append({"title": "无法评估", "content": "当前知识库中没有匹配的临床证据。", "citations": []})
+        sections.append({"title": "无充分证据", "content": "当前 CPIC 指南中没有匹配的临床证据。", "citations": []})
     return {"sections": sections, "confidence": "low", "disclaimer": "自动生成，仅供参考。",
             "has_sufficient_evidence": bool(struct_results or rule_result)}
