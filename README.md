@@ -127,22 +127,6 @@ python -m pytest tests/ -v              # 单元测试
 | `EVIDENCE_CHECK_ENABLED` | Writer-Reviewer 证据核验 | `true` |
 | `CHROMA_COLLECTION` | ChromaDB 集合名 | `pgx_knowledge` |
 
-## 上传 GitHub
-
-```bash
-cd PGx-Copilot
-git init
-git add .
-git status        # 确认没有 .env、data/ 等(已被 .gitignore 排除)
-git commit -m "init: PGx-Copilot pharmacogenomics retrieval system"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/PGx-Copilot.git
-git push -u origin main
-```
-
-> 认证：GitHub 已不支持密码，用 **Personal Access Token**(勾选 `repo` 权限)或 SSH。Push 时用户名输 `<你的用户名>`，密码输 token。若已有远程地址，先 `git remote set-url origin <repo>`。
-
-注意：`data/`、`.env`、`.venv/` 都不会上传(已被 .gitignore 排除)；CPIC dump 和 PDF 需要在上传后由使用者自行放入 `data/sources/` 重建。
 
 ## 常见问题
 
