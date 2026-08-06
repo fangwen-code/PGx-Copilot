@@ -1,0 +1,22 @@
+# PGx-Copilot backend (FastAPI + ChromaDB + LLM)
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# PyTorch CPU first (large, separate layer so it caches)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Python deps
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+
+# Download the embedding model at build time so `local_files_only=True`
+# works at runtime. Keep EMBEDDING_MODEL in .env in sync with this.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"
+
+# Backend code
+COPY backend/ /app/backend/
+WORKDIR /app/backend
+
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
