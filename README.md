@@ -134,6 +134,7 @@ python -m pytest tests/ -v              # 单元测试
 - **embedding 模型加载失败**：确认 `.env` 的 `EMBEDDING_MODEL` 已在本地缓存(`local_files_only=True`)，或先 `python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('<model>')"` 下载。
 - **Docker 内检索无结果**：确认 `data/` 已构建并挂载成功(`docker compose exec backend ls /app/data`)。
 
-## License
-
-科研/学习用途。CPIC 数据遵循 CPIC 官方使用条款，仅供参考。
+## 后续规划  
+1. 建更大规模的相关性评测集；
+2. 生成层用更强的LLM当裁判，对 faithfulness（是否忠于证据）和helpfulness（回答是否有用）批量自动化打分；
+3. 端到端找临床药师做盲评，不告诉他们是系统生成的还是人工写的，让他们打分，看报告是否准确、可用。
