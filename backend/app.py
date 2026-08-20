@@ -1,9 +1,11 @@
-"""PGx-Copilot: FastAPI backend — wired with CPIC query + RAG + report generation."""
+"""PGx-Copilot: FastAPI backend — multi-source PGx knowledge retrieval and exploration tool."""
+
+import re
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import HOST, PORT
+from config import HOST, PORT, CPIC_VERSION, CHINESE_DOC_TITLES
 from models.schemas import QueryRequest, ReportResponse, SourceRef, QueryIntent
 from rule_engine.registry import evaluate_all
 from query_understanding.parser import parse_query
@@ -21,6 +23,28 @@ app.add_middleware(
 
 retriever = Retriever()
 
+_STATIN_GENES = {"SLCO1B1", "APOE", "rs4149056", "rs7412", "rs429358"}
+_STATIN_DRUGS = {"simvastatin", "atorvastatin", "rosuvastatin", "pravastatin",
+                 "pitavastatin", "fluvastatin", "lovastatin"}
+# Chinese statin terms — the LLM parser often returns "他汀" / "辛伐他汀" as the
+# drug value, which the English-only _STATIN_DRUGS set would miss.
+_STATIN_TERMS = ("他汀", "statin", "辛伐他汀", "阿托伐他汀", "瑞舒伐他汀",
+                 "普伐他汀", "氟伐他汀", "洛伐他汀", "匹伐他汀")
+
+
+def _has_statin_content(genes: list[str] | None, drug: str | None,
+                        drug_class: str | None = None) -> bool:
+    """Check if query involves statin-related genes, drugs, or drug class."""
+    if genes and _STATIN_GENES & set(genes):
+        return True
+    if drug:
+        d = drug.lower()
+        if d in _STATIN_DRUGS or any(t in d for t in _STATIN_TERMS):
+            return True
+    if drug_class and drug_class.lower() in ("statin", "他汀", "他汀类"):
+        return True
+    return False
+
 
 @app.get("/health")
 async def health():
@@ -32,12 +56,18 @@ async def query(req: QueryRequest):
     """
     Main endpoint:
     1. Parse user intent
-    2. Route to CPIC structured query and/or RAG
-    3. Generate report
+    2. Multi-source retrieval:
+       - CPIC SQL: structured guideline lookup
+       - Rule engine: statin risk assessment
+       - RAG (PubMed): gene/drug mechanism background
+       - RAG (Chinese guideline): local consensus context
+    3. Synthesize results into an exploration report
     """
     try:
         return _handle_query(req)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[ERROR] Query failed: {e}")
         return ReportResponse(
             query=req.text,
@@ -49,12 +79,16 @@ async def query(req: QueryRequest):
 
 
 def _handle_query(req: QueryRequest) -> ReportResponse:
-    """Synchronous query handler with structured error handling."""
+    """Synchronous query handler with dual-channel routing."""
     # Step 1: Query Understanding
     intent = parse_query(req.text)
     parsed = QueryIntent(**intent)
 
-    # Debug info collector
+    has_exact_genotype = bool(parsed.genotypes and parsed.drug)
+    has_gene_or_drug = bool(parsed.genes or parsed.drug or parsed.genotypes)
+    has_statin = _has_statin_content(parsed.genes, parsed.drug, parsed.drug_class)
+
+    # Debug info
     debug = {"steps": []}
     parsed_data = {"原始查询": req.text, "intent": intent.get("intent", "")}
     if intent.get("genes"):
@@ -67,206 +101,379 @@ def _handle_query(req: QueryRequest) -> ReportResponse:
         parsed_data["症状"] = intent["symptom"]
     debug["steps"].append({"name": "查询解析", "data": parsed_data})
 
-    # Step 2: Determine routes
-    has_exact_genotype = bool(parsed.genotypes and parsed.drug)
-
-    # CPIC structured query (exact genotype match)
+    # ── CPIC Channel ──
+    # Layer 1: drug-first exact match (Level A/B only). A recommendation exists
+    # for a (gene, genotype) × drug pair, so matching starts from the parsed
+    # DRUG, inspects its own recommendation keys, converts the input genotypes
+    # to each key's value type (star / score / phenotype / function), and
+    # matches — multi-gene keys handled by construction. Both a gene/genotype
+    # AND a drug are required to enter this channel (has_exact_genotype);
+    # missing either → no recommendation.
+    #
+    # Statin-related genes (SLCO1B1/APOE/rs...) are routed EXCLUSIVELY to the
+    # statin rule engine — their CPIC rows are function-keyed multi-gene and add
+    # nothing the rule engine doesn't decide more directly. Other genes + a
+    # statin drug (e.g. CYP2C9-fluvastatin) still go through CPIC.
+    statin_genes = _STATIN_GENES & set(parsed.genotypes or {})
     structured_results = None
-    if has_exact_genotype:
+    if has_exact_genotype and not statin_genes:
         try:
             from cpic.query import CPICQuery
             q = CPICQuery()
-            for gene, gt in parsed.genotypes.items():
-                structured_results = q.match_genotype(gene, gt)
+            structured_results = q.match_drug_genotypes(parsed.drug, parsed.genotypes)
+            # Fallback: some guidelines key recommendations by PHENOTYPE, not
+            # allele diplotype (e.g. CYP2D6-metoprolol stores 'PM' not '*4/*4').
+            # When the drug-first match finds nothing, match by drug + gene so
+            # the CPIC drugrecommendation is still surfaced.
+            if not structured_results:
+                for gene in (parsed.genes or [])[:2]:
+                    result = q.get_recommendation(drug_name=parsed.drug, gene_symbol=gene)
+                    if result:
+                        structured_results = result
+                        break
             q.close()
         except Exception as e:
             print(f"[WARN] CPIC query failed: {e}")
 
-    # RAG retrieval (only if no structured results — avoid noise)
-    rag_response = {"results": [], "confidence": "low", "top_score": 0.0}
-    if not structured_results and retriever.store.available:
-        rag_response = retriever.search_by_intent(
-            query=req.text,
-            gene=parsed.genes[0] if parsed.genes else None,
-            drug=parsed.drug,
-            top_k=req.top_k or 5,
-        )
-    elif not retriever.store.available:
-        print("[WARN] Vector store unavailable, skipping RAG retrieval")
+    # CPIC RAG: PubMed abstracts (gene/drug background knowledge).
+    # Statin queries are covered by the rule engine + Chinese guideline,
+    # so the generic PubMed background is skipped for them (avoids a
+    # redundant "RAG: CPIC 摘要" route and CPIC background section).
+    cpic_rag = {"results": [], "top_score": 0.0}
+    if has_gene_or_drug and not has_statin and retriever.store.available:
+        try:
+            cpic_rag = retriever.search_by_intent(
+                query=req.text,
+                gene=parsed.genes[0] if parsed.genes else None,
+                drug=parsed.drug,
+                top_k=3,
+                source_filter="pubmed",
+            )
+        except Exception as e:
+            print(f"[WARN] CPIC RAG failed: {e}")
 
-    # Rule engine (registered engines matching input genotypes)
+    # ── Statin Channel ──
+    # Rule engine (SLCO1B1/APOE)
     rule_results = evaluate_all(parsed.genotypes or {})
     rule_result = next(iter(rule_results.values())) if rule_results else None
 
-    # Step 2b: Early rejection for unrelated queries (no structured data, poor RAG scores)
-    rag_results_list = rag_response.get("results", [])
-    if not structured_results and not rule_result:
-        top_score = rag_response.get("top_score", 0)
-        if top_score <= 0 or not rag_results_list:
-            return ReportResponse(
+    # Statin RAG: Chinese guideline PDFs.
+    # (The root cause of the earlier Chinese hybrid regression — BM25 branch
+    # missing the gene/drug metadata filter — is fixed in hybrid.py, so hybrid
+    # is used uniformly across sources.)
+    statin_rag = {"results": [], "top_score": 0.0}
+    if has_statin and retriever.store.available:
+        try:
+            statin_rag = retriever.search_by_intent(
                 query=req.text,
-                parsed_intent=parsed,
-                rule_engine_result=None,
-                report_text=(
-                    "## 无充分证据\n\n"
-                    "当前 CPIC 指南中没有与您描述相关的药物基因组学证据。\n\n"
-                    "请提供更具体的药物、基因或基因型信息以便进一步查询。\n\n"
-                    "> ⚠️ **本结论仅基于 CPIC 指南数据，不排除其他临床证据来源。**"
-                ),
-                sources=[],
+                gene=parsed.genes[0] if parsed.genes else None,
+                drug=parsed.drug,
+                top_k=3,
+                source_filter="chinese_guideline",
             )
+        except Exception as e:
+            print(f"[WARN] Statin RAG failed: {e}")
 
-    # Step 3: Generate report
-    report = generate_report(
-        user_query=req.text,
-        parsed_intent=intent,
-        structured_results=structured_results,
-        rag_results=rag_response.get("results", []),
-        rule_engine_result=rule_result,
+    # ── Gene / drug background (CPIC) ──
+    # Gene-function / drug background from the CPIC database so the report can
+    # always write a Gene Summary / Drug Summary, even when RAG has no hits.
+    gene_background: dict[str, dict] = {}
+    drug_info: list[dict] = []
+    if parsed.genes or parsed.drug:
+        try:
+            from cpic.query import CPICQuery
+            q = CPICQuery()
+            for gene in (parsed.genes or [])[:2]:
+                gb = {
+                    "info": q.get_gene_info(gene),
+                    "alleles": q.get_alleles(gene),
+                    "results": q.get_gene_result(gene),
+                }
+                if any(gb.values()):
+                    gene_background[gene] = gb
+            if parsed.drug:
+                drug_info = q.get_drug_info(parsed.drug) or []
+            q.close()
+        except Exception as e:
+            print(f"[WARN] CPIC background fetch failed: {e}")
+
+    # ── Gap logging + early rejection ──
+    has_any_answer = bool(
+        structured_results or rule_result
+        or cpic_rag.get("results") or statin_rag.get("results")
+        or gene_background or drug_info
     )
+    if not has_any_answer:
+        try:
+            from tools.conflict_logger import log_gap
+            log_gap(query=req.text, parsed_intent=intent,
+                    rag_results=[], confidence="no_source", top_score=0.0)
+        except Exception as e:
+            print(f"[WARN] Gap logging failed: {e}")
+        return ReportResponse(
+            query=req.text, parsed_intent=parsed, rule_engine_result=None,
+            report_text="## 无充分证据\n\n当前知识库中没有与您描述相关的药物基因组学证据。\n\n请提供更具体的药物、基因或基因型信息以便进一步查询。\n\n> ⚠️ **本结果仅基于现有知识库数据，不排除其他来源存在相关信息。**",
+            sources=[],
+        )
 
-    # Step 4: Build source references
-    sources = _build_sources(rag_response.get("results", []), structured_results)
+    # ── Report generation ──
+    # RAG hits are passed as evidence so the LLM can write Gene Summary /
+    # Clinical Relevance from the actual guideline content, not only from
+    # CPIC structured data + the rule engine.
+    # A failure here must NOT take down the whole request: the deterministic
+    # recommendation (below) is the medically-important part. Degrade to an
+    # empty-report fallback instead, and log the full traceback.
+    try:
+        report = generate_report(
+            user_query=req.text,
+            parsed_intent=intent,
+            structured_results=structured_results,
+            rule_engine_result=rule_result,
+            rag_results={
+                "chinese_guideline": statin_rag.get("results", []),
+                "pubmed": cpic_rag.get("results", []),
+            },
+            gene_background=gene_background,
+            drug_info=drug_info,
+            language=("chinese" if has_statin else "english"),
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[WARN] Report generation failed, degrading: {e}")
+        report = {
+            "sections": [],
+            "confidence": "low",
+            "disclaimer": "",
+            "has_sufficient_evidence": False,
+        }
+    sources = _build_sources(structured_results)
 
-    # Build debug info
-    # -- routing decision: show only the PRIMARY route
-    routes = []
+    # Deterministic recommendation — shown verbatim as the report headline.
+    # Statin → rule engine; other exact CPIC matches → CPIC recommendation.
+    recommendation = None
+    recommendation_src = ""
     if rule_result:
-        routes.append(f"✅ 规则引擎（{', '.join(rule_results.keys())}）")
+        recommendation = rule_result
+        recommendation_src = "规则引擎（SLCO1B1/APOE 基因多态性检测）"
     elif structured_results:
-        routes.append(f"✅ CPIC 结构化查询（精确基因型匹配）")
-    elif rag_response.get("results"):
-        routes.append(f"✅ RAG 语义检索（top_score={rag_response.get('top_score', 0):.2f}）")
-    else:
-        routes.append("❌ 知识库无匹配 → 返回无充分证据")
+        for r in structured_results[:3]:
+            dr = (r.get("drugrecommendation") or "").strip()
+            if dr:
+                recommendation = dr
+                recommendation_src = "CPIC Guideline"
+                break
+
+    # Raw "Retrieved Evidence" lives in the technical-analysis panel, not the
+    # polished main report. The source line at the end keeps the PMIDs /
+    # guideline sources visible for traceability.
+    # Medical accuracy first: a recommendation is shown ONLY when a
+    # deterministic source (rule engine / CPIC structured) produced one. Any
+    # LLM-generated "Recommendation" section is always dropped.
+    # Gene / Drug Summary sections are omitted when the query has no gene /
+    # drug, so the report only shows the sections the user's input calls for.
+    has_gene_in_query = bool(parsed.genes or parsed.genotypes)
+    has_drug_in_query = bool(parsed.drug or parsed.drug_class)
+    main_sections = []
+    evidence_for_debug = ""
+    for sec in report.get("sections", []):
+        t = (sec.get("title", "") or "").lower()
+        if "retrieved evidence" in t or "evidence" in t or "证据" in t:
+            evidence_for_debug = _italicize_genes(sec.get("content", "") or "")
+        elif "reference" in t or "参考" in t:
+            continue
+        elif "recommendation" in t or "推荐" in t:
+            continue
+        elif ("gene summary" in t or "基因摘要" in t or "基因概述" in t
+              or "基因简介" in t or "基因总结" in t) and not has_gene_in_query:
+            continue
+        elif ("drug summary" in t or "药物摘要" in t or "药物概述" in t
+              or "药物简介" in t or "药物总结" in t) and not has_drug_in_query:
+            continue
+        else:
+            main_sections.append(sec)
+    if main_sections:
+        report = {**report, "sections": main_sections}
+
+    # ── Debug info ──
+    routes = []
+    if structured_results:
+        routes.append("CPIC SQL: 精确基因型匹配")
+    if rule_result:
+        routes.append(f"规则引擎: 他汀评估")
+    if cpic_rag.get("results"):
+        routes.append(f"RAG: CPIC 摘要（{cpic_rag.get('top_score', 0):.2f}）")
+    if statin_rag.get("results"):
+        routes.append(f"RAG: 他汀指南（{statin_rag.get('top_score', 0):.2f}）")
+    if not routes:
+        routes.append("Gap Log")
     debug["steps"].append({"name": "路由决策", "data": {"路由": routes}})
 
-    # -- RAG details (only when RAG was the PRIMARY source of answer)
-    if rag_response.get("results") and not rule_result:
-        import hashlib
-        seen_content = set()
-        rerank_scores = []
-        dup_count = 0
-        for r in rag_response.get("results", []):
-            content_key = hashlib.md5(r.get("content", "")[:80].encode()).hexdigest()
-            score = r.get("rerank_score") or (1.0 - (r.get("distance") or 0))
-            meta = r.get("metadata", {})
-            entry = {
-                "score": round(float(score), 3),
-                "source": meta.get("source", ""),
-                "drug": meta.get("drug", ""),
-                "gene": meta.get("gene", ""),
-            }
-            if content_key in seen_content:
-                dup_count += 1
-                continue
-            seen_content.add(content_key)
-            rerank_scores.append(entry)
-        dedup_note = ""
-        if dup_count > 0:
-            dedup_note = f"（原始 {len(rerank_scores) + dup_count} 条，去重合并 {dup_count} 条相似内容）"
-        rag_detail = {
-            "策略": "语义向量搜索（ChromaDB + bge-base-en-v1.5）",
-            "查询改写": rag_response.get("expanded_queries", [req.text]),
-            "总检索数": rag_response.get("total_retrieved", 0),
-            "rerank 后取 top": len(rerank_scores),
-            "证据校验删除": rag_response.get("irrelevant_removed", 0),
-            "rerank 得分": rerank_scores,
-            "去重说明": dedup_note,
-        }
-        if rag_response.get("hyde_used"):
-            rag_detail["HyDE"] = "已启用"
-        debug["steps"].append({"name": "RAG 检索", "data": rag_detail})
+    # RAG retrieval detail — makes the rerank / evidence-filter layer visible.
+    for tag, rag in (("他汀指南（中国共识）", statin_rag), ("PubMed/CPIC 背景", cpic_rag)):
+        if rag.get("results"):
+            debug["steps"].append({"name": "RAG 检索", "data": _rag_debug_data(tag, rag)})
 
-    # -- report quality
-    debug["steps"].append({
-        "name": "报告质量", "data": {
-            "置信度": report.get("confidence", "low"),
-            "章节数": len(report.get("sections", [])),
-            "证据校验": "通过" if not report.get("evidence_warning") else report.get("evidence_warning"),
-        }
-    })
+    if evidence_for_debug:
+        debug["steps"].append({"name": "检索证据", "data": {"证据": evidence_for_debug}})
+
+    # CPIC structured sources — the "检索依据" moved into the technical panel.
+    if sources:
+        debug["steps"].append({"name": "检索依据", "data": {"依据": [
+            {"label": f"CPIC — {s.drug}", "content": s.content[:300]} for s in sources
+        ]}})
 
     return ReportResponse(
-        query=req.text,
-        parsed_intent=parsed,
+        query=req.text, parsed_intent=parsed,
         rule_engine_result=rule_result,
-        report_text=_format_report(report),
-        sources=sources,
-        debug_info=debug,
+        report_text=_format_report(report, recommendation=recommendation, recommendation_src=recommendation_src, is_statin=has_statin),
+        sources=sources, debug_info=debug,
     )
 
 
-def _build_sources(
-    rag_results: list[dict],
-    structured_results: list[dict] | None,
-) -> list[SourceRef]:
-    """Build source list. Only include high relevance results (>= 0.7)."""
+def _build_sources(structured_results: list[dict] | None) -> list[SourceRef]:
+    if not structured_results:
+        return []
     sources = []
-    seen = set()
-
-    for r in rag_results[:5]:
-        meta = r.get("metadata", {})
-        src_key = f"{meta.get('source', '')}-{meta.get('pmid', '')}-{meta.get('drug', '')}"
-        if src_key in seen:
-            continue
-        seen.add(src_key)
-
-        # Prefer rerank_score; fall back to distance; clamp to >= 0
-        score = r.get("rerank_score") or (1.0 - (r.get("distance") or 0))
-        score = max(0.0, float(score))
-
-        # Only show high-confidence sources to users
-        if score < 0.7:
-            continue
-
+    for i, r in enumerate(structured_results[:5]):
         sources.append(SourceRef(
-            id=len(sources) + 1,
-            content=_clean_chunk_content(r["content"]),
-            source=meta.get("source", "CPIC"),
-            year=meta.get("year", ""),
-            drug=meta.get("drug", ""),
-            gene=meta.get("gene", ""),
-            relevance=round(float(score), 3),
+            id=i + 1, content=r.get("drugrecommendation", "")[:300],
+            source="CPIC", drug=r.get("lookupkey", ""), relevance=1.0,
         ))
-
     return sources
 
 
-def _clean_chunk_content(content: str) -> str:
-    """Strip technical metadata lines from chunk content for user display."""
-    lines = content.split("\n")
-    cleaned = []
-    for line in lines:
-        if line.startswith("[") and line.strip().endswith("]"):
-            continue
-        stripped = line.strip()
-        if stripped.startswith("Drug:") or stripped.startswith("Genotype:") or \
-           stripped.startswith("Classification:") or stripped.startswith("Phenotype:"):
-            continue
-        cleaned.append(line)
-    return "\n".join(cleaned).strip()[:500]
+# Gene symbols are italicized in report markdown (standard PGx convention).
+# HLA is excluded — allele symbols carry `*` (e.g. HLA-B*57:01) which would
+# break markdown italics.
+_GENE_PATTERN = re.compile(
+    r"(?<![*A-Za-z])"
+    r"(?:CYP\d[A-Z]\d\w*"
+    r"|NAT2|TPMT|NUDT15|SLCO1B1|OATP1B1|APOE|VKORC1|DPYD|UGT1A1|BCHE|G6PD"
+    r"|ADRB[12]|ADRA2C|GRK[45]|AGTR1|ACE|NPPA|CACNA1C|CACNB2|NEDD4L|YEATS4)"
+    r"(?![\w*])",
+    re.IGNORECASE,
+)
 
 
-def _format_report(report: dict) -> str:
-    """Convert structured report dict to formatted text."""
+def _italicize_genes(text: str) -> str:
+    """Wrap gene symbols in italic markdown (*gene*); skip already-italicized."""
+    return _GENE_PATTERN.sub(lambda m: f"*{m.group(0)}*", text)
+
+
+def _rag_debug_data(label: str, rag: dict) -> dict:
+    """Format a RAG retrieval result for the technical-analysis panel.
+
+    The frontend's "RAG 检索" step renders the cross-encoder rerank scores,
+    query expansion, and evidence-filter stats — the retrieval-quality layer.
+    Each item carries a `ref` so the retrieved source is verifiable (PMID for
+    PubMed, document title for the Chinese guidelines).
+    """
+    results = rag.get("results", []) or []
+    scores = []
+    for r in results[:5]:
+        meta = r.get("metadata", {}) or {}
+        score = r.get("rerank_score")
+        if score is None and r.get("distance") is not None:
+            score = 1.0 - float(r["distance"])
+        if score is None:
+            score = r.get("bm25_score") or 0.0
+        ref = ""
+        if meta.get("pmid"):
+            ref = f"PMID {meta.get('pmid')}"
+        elif meta.get("filename"):
+            ref = CHINESE_DOC_TITLES.get(str(meta.get("filename")), str(meta.get("filename")))
+        elif meta.get("title"):
+            ref = str(meta.get("title"))
+        scores.append({
+            "score": max(0.0, min(1.0, float(score))),
+            "source": meta.get("source", ""),
+            "drug": meta.get("drug", ""),
+            "gene": meta.get("gene", ""),
+            "ref": ref,
+            "snippet": (r.get("content", "") or "")[:120],
+        })
+    return {
+        "策略": label,
+        "查询改写": rag.get("expanded_queries", []),
+        "总检索数": rag.get("total_retrieved", 0),
+        "rerank 后取 top": len(results),
+        "证据校验删除": rag.get("irrelevant_removed", 0),
+        "rerank 得分": scores,
+    }
+
+
+def _format_report(
+    report: dict,
+    recommendation: str | None = None,
+    recommendation_src: str = "",
+    is_statin: bool = False,
+) -> str:
+    """Convert report dict to formatted text.
+
+    A deterministic "Recommendation" (rule engine / CPIC) — or an explicit
+    "cannot provide a recommendation" note when none exists — headlines the
+    report, then the LLM-written sections (Gene Summary / Drug Summary /
+    Clinical Relevance) provide the analysis, each with its own source
+    annotation.
+
+    Heading hierarchy (rendered by the frontend under "检索分析报告"):
+      ###  Recommendation (deterministic, or an explicit "cannot provide" note)
+      ###  Gene Summary / Drug Summary / Clinical Relevance
+    """
     if not report.get("sections"):
         return "（无法生成报告）"
 
     lines = []
-
-    # Evidence check warning (if any)
     if report.get("evidence_warning"):
-        lines.append(f"> ⚠️ **证据校验警告**: {report['evidence_warning']}\n")
+        warn_label = "⚠️ Evidence Check Warning" if not is_statin else "⚠️ 证据校验警告"
+        lines.append(f"> {warn_label}: {report['evidence_warning']}\n")
+
+    # Recommendation headline — deterministic only. When no deterministic
+    # recommendation exists, state it explicitly (medical accuracy first:
+    # never fabricate advice, but don't stay silent either).
+    rec_label = "Recommendation" if not is_statin else "推荐建议"
+    lines.append(f"### {rec_label}")
+    src_word = "Sources" if not is_statin else "来源"
+    if recommendation:
+        lines.append(recommendation)
+        if recommendation_src:
+            lines.append(f"*{src_word}: {recommendation_src}*")
+    else:
+        no_rec = ("Based on the available information, an accurate medication "
+                  "recommendation cannot be provided."
+                  if not is_statin else
+                  "基于已有的信息，无法获取准确的推荐建议。")
+        lines.append(no_rec)
+    lines.append("")
+
+    def _norm_src(s: str) -> str:
+        s = (s or "").strip()
+        if s.lower() in ("cpic", "cpic guideline"):
+            return "CPIC Guideline"
+        if s.lower() in ("pubmed", "pubmed abstract"):
+            return "PubMed"
+        return s
 
     for sec in report["sections"]:
-        lines.append(f"## {sec['title']}")
-        lines.append(sec["content"])
+        lines.append(f"### {sec['title']}")
+        lines.append(_italicize_genes(sec["content"]))
+        cites = [_norm_src(c) for c in (sec.get("citations") or []) if _norm_src(c)]
+        if cites:
+            lines.append(f"*{src_word}: {', '.join(cites)}*")
         lines.append("")
 
-    if report.get("disclaimer"):
-        lines.append(f"*{report['disclaimer']}*")
-
+    # One disclaimer, in the user's language per query type.
+    disclaimer = (
+        "*本报告为科研探索工具生成的结果，仅供研究参考，不构成临床建议。*"
+        if is_statin else
+        "*This report is generated by a research tool for research reference only and does not constitute medical advice.*"
+    )
+    lines.append("")
+    lines.append("---")
+    lines.append(disclaimer)
+    cpic_note = f"基于 CPIC {CPIC_VERSION} 指南" if is_statin else f"Based on CPIC {CPIC_VERSION} guidelines"
+    lines.append(f"*{cpic_note}*")
     return "\n".join(lines)
 
 
