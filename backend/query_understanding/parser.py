@@ -17,7 +17,7 @@ Extract structured information from the user's question.
 
 Return ONLY a JSON object with these optional fields:
 - "genes": list of gene symbols mentioned (e.g. ["CYP2D6", "SLCO1B1"])
-- "genotypes": dict mapping gene to genotype (e.g. {"CYP2D6": "*4/*4", "SLCO1B1": "TC"})
+- "genotypes": dict mapping gene to genotype. If a metabolizer phenotype or function is EXPLICITLY stated, use its ENGLISH name as the value (e.g. "中间代谢" → "Intermediate Metabolizer", "poor metabolizer" → "Poor Metabolizer") — English values match the CPIC key directly. Values MUST be in English. Only use a star allele (e.g. "*4/*4") when no phenotype/function is stated.
 - "drug": the SPECIFIC drug name (e.g. "metoprolol", "simvastatin"). Only set when a specific drug is named.
 - "drug_class": drug class if mentioned (e.g. "CCB", "beta blocker", "statin")
 
@@ -171,6 +171,69 @@ def _load_drug_names() -> list[str]:
     return names
 
 
+def _parse_lookupkey(lk: str) -> dict:
+    """Parse the DB's single/double-quoted JSON lookupkey
+    (e.g. "{'CYP2C19': '*2/*2'}" or '{"UGT1A1": "Poor Metabolizer"}')."""
+    if not lk:
+        return {}
+    try:
+        return json.loads(lk.replace("'", '"'))
+    except json.JSONDecodeError:
+        return {}
+
+
+_known_values_cache: dict[str, set[str]] | None = None
+
+
+def _load_known_values() -> dict[str, set[str]]:
+    """Load per-gene known genotype values from the recommendation lookupkeys.
+
+    Direct extraction source: the DB already stores the values a genotype can
+    take (phenotype / function / activity score / star allele). The fallback
+    parser looks these up in the user text instead of regex-matching shapes.
+    """
+    global _known_values_cache
+    if _known_values_cache is not None:
+        return _known_values_cache
+    mapping: dict[str, set[str]] = {}
+    try:
+        import sqlite3
+        from config import DATA_DIR
+        conn = sqlite3.connect(DATA_DIR / "cpic.db")
+        rows = conn.execute("SELECT lookupkey FROM recommendation").fetchall()
+        conn.close()
+    except Exception:
+        _known_values_cache = mapping
+        return mapping
+    for (lk,) in rows:
+        for gene, val in _parse_lookupkey(lk or "").items():
+            v = str(val).strip().lower()
+            if v:
+                mapping.setdefault(str(gene).upper(), set()).add(v)
+    _known_values_cache = mapping
+    return mapping
+
+
+def _extract_genotype(tail: str, gene: str) -> str | None:
+    """Directly extract a genotype value following a gene mention.
+
+    Preferred: the longest known DB value for the gene (phenotype / function /
+    activity score) present in the tail — a direct lookup, no shape-matching.
+    Fallback: a star-allele diplotype / score token right after the mention
+    (star alleles are pattern-shaped, not enumerable).
+    """
+    best = ""
+    for v in _load_known_values().get(gene.upper(), ()):
+        if v and v in tail and len(v) > len(best):
+            best = v
+    m = re.match(
+        r"[\s,;:]*((?:≥|>)?\d+\.\d+|\*?\d+(?:\s*/\s*\*?\d+)?|\d+)", tail
+    )
+    if m and len(m.group(1)) > len(best):
+        best = m.group(1)
+    return best or None
+
+
 def _fallback_parse(user_input: str) -> dict:
     """Simple fallback when LLM is unavailable."""
     result = {"intent": "general"}
@@ -184,13 +247,12 @@ def _fallback_parse(user_input: str) -> dict:
         m = re.search(pattern, text)
         if m:
             genes.append(gene)
-            # Try to extract genotype after gene mention.
-            # Wrap `pattern` in a non-capturing group: some gene patterns contain
-            # alternation (e.g. "cyp\s*2\s*d\s*6|2d6"); without grouping, the
-            # genotype capture group drops out of the match and becomes None.
-            gt_match = re.search(rf"(?:{pattern})[\s,;]*(\*?\d+[\*\/]\*?\d+)", text)
-            if gt_match and gt_match.group(1):
-                genotypes[gene] = gt_match.group(1).strip()
+            # Extract the genotype directly: the longest known DB value
+            # (phenotype / function / activity score) appearing after the
+            # mention, else a star-allele diplotype right after it.
+            gt = _extract_genotype(text[m.end():], gene)
+            if gt:
+                genotypes[gene] = gt
 
     # Drug class vs specific drug: generic class terms (他汀/CCB/ARB...) are
     # NOT mapped to a specific drug.
